@@ -14,5 +14,9 @@ The [workflow](.github/workflows/windows-check.yml):
    - `prove --write_vk`: writes the proof and the key, compared byte for byte with the bb.js output;
    - `verify`: reads the reference proof, public inputs and key.
 
+   Each binary gets its own CRS cache (`-c`): the CRS is cached through the same `write_file`, so the
+   official build writes a corrupted cache that a binary-mode reader can't use. An extra informational step
+   runs the patched build on the official build's cache, which is what an upgrading Windows user would hit.
+
 The run passes only if the official build fails (the bug is reproduced) and the patched build passes every
 check. The results table is on each run's summary page.

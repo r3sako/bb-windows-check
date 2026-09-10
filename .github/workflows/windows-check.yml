@@ -97,16 +97,18 @@ jobs:
           target=noir-recursive-no-zk
 
           size() { if [ -f "$1" ]; then wc -c < "$1" | tr -d ' '; else echo "no"; fi; }
-          first_error() { grep -m1 -i -E "error|wrong size|failed|unable" "$1" | tr '|' '/' | cut -c1-140; }
+          first_error() { grep -m1 -i -E "error|wrong size|failed|unable|not on the curve" "$1" | tr '|' '/' | cut -c1-200; }
 
+          # Each binary gets its own CRS cache (-c). The CRS is cached through the same write_file, so
+          # the official bb.exe writes it in text mode, which corrupts it for a binary-mode reader.
           run_checks() {
-            local name=$1 bin=$2 fails=0 code
+            local name=$1 bin=$2 crs="crs-$1" fails=0 code
             local cells=()
             mkdir -p "$name/with_key" "$name/write_vk"
 
             # 1. Prove with the key bb.js wrote. Its first 0x1A byte is at offset 983.
             "$bin" prove --scheme ultra_honk -b $fx/circuit.json -w $fx/witness.gz -k $fx/vk \
-              -t $target -o "$name/with_key" > "$name/1.log" 2>&1
+              -t $target -c "$crs" -o "$name/with_key" > "$name/1.log" 2>&1
             code=$?
             if [ $code -eq 0 ] && cmp -s "$name/with_key/proof" $fx/proof && cmp -s "$name/with_key/public_inputs" $fx/public_inputs; then
               cells+=("✅ proof identical to bb.js")
@@ -117,7 +119,7 @@ jobs:
 
             # 2. Prove and write the key. The reference proof contains 53 0x0A bytes.
             "$bin" prove --scheme ultra_honk -b $fx/circuit.json -w $fx/witness.gz --write_vk \
-              -t $target -o "$name/write_vk" > "$name/2.log" 2>&1
+              -t $target -c "$crs" -o "$name/write_vk" > "$name/2.log" 2>&1
             code=$?
             if [ $code -eq 0 ] && cmp -s "$name/write_vk/proof" $fx/proof && cmp -s "$name/write_vk/vk" $fx/vk; then
               cells+=("✅ proof and vk identical to bb.js")
@@ -128,7 +130,7 @@ jobs:
 
             # 3. Verify the reference proof with the reference key.
             "$bin" verify --scheme ultra_honk -k $fx/vk -p $fx/proof -i $fx/public_inputs \
-              -t $target > "$name/3.log" 2>&1
+              -t $target -c "$crs" > "$name/3.log" 2>&1
             code=$?
             if [ $code -eq 0 ]; then
               cells+=("✅ verified")
@@ -159,6 +161,20 @@ jobs:
           official_fails=$?
           run_checks patched patched/bb.exe
           patched_fails=$?
+
+          # Upgrade path, informational: the patched bb.exe reusing the CRS cache the official one wrote.
+          mkdir -p upgrade
+          patched/bb.exe prove --scheme ultra_honk -b $fx/circuit.json -w $fx/witness.gz -k $fx/vk \
+            -t $target -c crs-official -o upgrade > upgrade.log 2>&1
+          upgrade_code=$?
+          echo "::group::upgrade path"
+          cat upgrade.log
+          ls -l crs-official crs-patched
+          echo "::endgroup::"
+          {
+            echo
+            echo "**Upgrade path (informational).** CRS cache \`bn254_g1.dat\` written by the official bb.exe: $(size crs-official/bn254_g1.dat) B, by the patched one: $(size crs-patched/bn254_g1.dat) B. The patched bb.exe reusing the official cache: exit $upgrade_code. $(first_error upgrade.log)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
           echo >> "$GITHUB_STEP_SUMMARY"
           if [ $patched_fails -ne 0 ]; then
