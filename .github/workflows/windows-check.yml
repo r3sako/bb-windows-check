@@ -1,0 +1,172 @@
+name: bb.exe binary I/O check
+
+# Reproduces AztecProtocol/aztec-packages#25434 on a real Windows machine: the official bb.exe
+# 5.2.0 against 5.2.0 with the fix applied, on the fixtures attached to the issue.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      fix_commit:
+        description: Commit in r3sako/aztec-packages that contains the fix
+        required: false
+
+env:
+  FIX_COMMIT: ${{ inputs.fix_commit || '218abcf6ad95d1b2697af1b356ea29e00ac13314' }}
+  BB_VERSION: v5.2.0
+  ZIG_VERSION: 0.15.1
+  FIXTURES: https://raw.githubusercontent.com/alejoamiras/presto/bc25102dd61244df665513cbdbfdce401f2d2cea/fixtures/noir/square
+
+jobs:
+  build:
+    name: Build bb.exe 5.2.0 + fix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - name: Fetch barretenberg ${{ env.BB_VERSION }}
+        run: |
+          git clone --depth 1 --branch "$BB_VERSION" --filter=blob:none --sparse https://github.com/AztecProtocol/aztec-packages.git aztec
+          git -C aztec sparse-checkout set barretenberg/cpp
+
+      - name: Apply the fix (${{ env.FIX_COMMIT }})
+        run: |
+          curl -fsSL "https://github.com/r3sako/aztec-packages/commit/$FIX_COMMIT.patch" -o fix.patch
+          git -C aztec apply --verbose "$GITHUB_WORKSPACE/fix.patch"
+
+      - name: Install Zig ${{ env.ZIG_VERSION }} and Ninja
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q ninja-build
+          curl -fsSL "https://ziglang.org/download/$ZIG_VERSION/zig-x86_64-linux-$ZIG_VERSION.tar.xz" | tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-x86_64-linux-$ZIG_VERSION" >> "$GITHUB_PATH"
+
+      - name: Cross-compile bb.exe with the release preset
+        working-directory: aztec/barretenberg/cpp
+        run: |
+          zig version
+          cmake --preset amd64-windows
+          cmake --build --preset amd64-windows --target bb
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bb-patched
+          path: aztec/barretenberg/cpp/build-amd64-windows/bin/bb.exe
+          if-no-files-found: error
+
+  windows:
+    name: Run the issue's scenario on Windows
+    needs: build
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: bb-patched
+          path: patched
+
+      - name: Download the official bb.exe ${{ env.BB_VERSION }}
+        run: |
+          curl -fsSL -o official.tar.gz "https://github.com/AztecProtocol/aztec-packages/releases/download/$BB_VERSION/barretenberg-amd64-windows.tar.gz"
+          mkdir official
+          tar -xzf official.tar.gz -C official
+          ls -l official patched
+
+      - name: Download the fixtures from the issue
+        run: |
+          mkdir fixtures
+          for f in circuit.json witness.gz vk proof public_inputs; do
+            curl -fsSL "$FIXTURES/$f" -o "fixtures/$f"
+          done
+          cd fixtures
+          # Hashes from the fixture's manifest.json.
+          sha256sum -c <<'EOF'
+          382ceba84c157188bbe4d4a7752ad9a9567af507cd661c9f75a4bd68c69d8fd3  circuit.json
+          3b49e123f993167f10800d0c4862541974289d49022f2992fd92342bd1ea58d1  witness.gz
+          a0a126aec7091ce84a90085eb783402fd7f09ecb93bea969471c41324ff58270  vk
+          be8d94a8411378f71d83fe24d010c9a52237f92d9eaceee7c467a28632bf9ef6  proof
+          abfaabe0da5c58b596c45ab1342451b3c802817182f30550997c88972233ba9c  public_inputs
+          EOF
+
+      - name: Compare the official and the patched bb.exe
+        run: |
+          set +e
+          fx=fixtures
+          target=noir-recursive-no-zk
+
+          size() { if [ -f "$1" ]; then wc -c < "$1" | tr -d ' '; else echo "no"; fi; }
+          first_error() { grep -m1 -i -E "error|wrong size|failed|unable" "$1" | tr '|' '/' | cut -c1-140; }
+
+          run_checks() {
+            local name=$1 bin=$2 fails=0 code
+            local cells=()
+            mkdir -p "$name/with_key" "$name/write_vk"
+
+            # 1. Prove with the key bb.js wrote. Its first 0x1A byte is at offset 983.
+            "$bin" prove --scheme ultra_honk -b $fx/circuit.json -w $fx/witness.gz -k $fx/vk \
+              -t $target -o "$name/with_key" > "$name/1.log" 2>&1
+            code=$?
+            if [ $code -eq 0 ] && cmp -s "$name/with_key/proof" $fx/proof && cmp -s "$name/with_key/public_inputs" $fx/public_inputs; then
+              cells+=("✅ proof identical to bb.js")
+            else
+              cells+=("❌ exit $code, proof: $(size "$name/with_key/proof") B. $(first_error "$name/1.log")")
+              fails=$((fails + 1))
+            fi
+
+            # 2. Prove and write the key. The reference proof contains 53 0x0A bytes.
+            "$bin" prove --scheme ultra_honk -b $fx/circuit.json -w $fx/witness.gz --write_vk \
+              -t $target -o "$name/write_vk" > "$name/2.log" 2>&1
+            code=$?
+            if [ $code -eq 0 ] && cmp -s "$name/write_vk/proof" $fx/proof && cmp -s "$name/write_vk/vk" $fx/vk; then
+              cells+=("✅ proof and vk identical to bb.js")
+            else
+              cells+=("❌ exit $code, proof: $(size "$name/write_vk/proof") B, vk: $(size "$name/write_vk/vk") B. $(first_error "$name/2.log")")
+              fails=$((fails + 1))
+            fi
+
+            # 3. Verify the reference proof with the reference key.
+            "$bin" verify --scheme ultra_honk -k $fx/vk -p $fx/proof -i $fx/public_inputs \
+              -t $target > "$name/3.log" 2>&1
+            code=$?
+            if [ $code -eq 0 ]; then
+              cells+=("✅ verified")
+            else
+              cells+=("❌ exit $code. $(first_error "$name/3.log")")
+              fails=$((fails + 1))
+            fi
+
+            echo "| $name | ${cells[0]} | ${cells[1]} | ${cells[2]} |" >> "$GITHUB_STEP_SUMMARY"
+            for i in 1 2 3; do
+              echo "::group::$name, check $i"
+              cat "$name/$i.log"
+              echo "::endgroup::"
+            done
+            return $fails
+          }
+
+          {
+            echo "## bb.exe $BB_VERSION on Windows, fixtures from AztecProtocol/aztec-packages#25434"
+            echo
+            echo "Reference (bb.js 5.2.0): proof 13120 B, vk 3680 B. Expected: official ❌ (the bug), patched ✅."
+            echo
+            echo "| bb.exe | \`prove -k vk\` (reads the bb.js key) | \`prove --write_vk\` (writes proof and vk) | \`verify\` (reads proof, public inputs, vk) |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          run_checks official official/bb.exe
+          official_fails=$?
+          run_checks patched patched/bb.exe
+          patched_fails=$?
+
+          echo >> "$GITHUB_STEP_SUMMARY"
+          if [ $patched_fails -ne 0 ]; then
+            echo "::error::The patched bb.exe failed $patched_fails of 3 checks"
+            exit 1
+          fi
+          if [ $official_fails -eq 0 ]; then
+            echo "::error::The official bb.exe passed every check, so the bug was not reproduced and the comparison proves nothing"
+            exit 1
+          fi
+          echo "The official bb.exe failed $official_fails of 3 checks; the patched bb.exe passed all 3." >> "$GITHUB_STEP_SUMMARY"
