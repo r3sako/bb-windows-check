@@ -104,7 +104,8 @@ jobs:
           run_checks() {
             local name=$1 bin=$2 crs="crs-$1" fails=0 code
             local cells=()
-            mkdir -p "$name/with_key" "$name/write_vk"
+            # -c requires an existing directory; bb downloads the missing CRS files into it.
+            mkdir -p "$crs" "$name/with_key" "$name/write_vk"
 
             # 1. Prove with the key bb.js wrote. Its first 0x1A byte is at offset 983.
             "$bin" prove --scheme ultra_honk -b $fx/circuit.json -w $fx/witness.gz -k $fx/vk \
