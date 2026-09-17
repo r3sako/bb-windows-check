@@ -9,11 +9,15 @@ on:
   workflow_dispatch:
     inputs:
       fix_commit:
-        description: Commit in r3sako/aztec-packages that contains the fix
+        description: Head commit of the fix branch in r3sako/aztec-packages
+        required: false
+      fix_base:
+        description: Commit the fix branch forked from (the diff is taken from here)
         required: false
 
 env:
-  FIX_COMMIT: ${{ inputs.fix_commit || '218abcf6ad95d1b2697af1b356ea29e00ac13314' }}
+  FIX_COMMIT: ${{ inputs.fix_commit || '7ad1851ecec1d966e86f9e96a2b3e17d9744fa21' }}
+  FIX_BASE: ${{ inputs.fix_base || 'e618de4955e90b5feb87e3962edc6a1d1d7e7349' }}
   BB_VERSION: v5.2.0
   ZIG_VERSION: 0.15.1
   FIXTURES: https://raw.githubusercontent.com/alejoamiras/presto/bc25102dd61244df665513cbdbfdce401f2d2cea/fixtures/noir/square
@@ -31,8 +35,9 @@ jobs:
 
       - name: Apply the fix (${{ env.FIX_COMMIT }})
         run: |
-          curl -fsSL "https://github.com/r3sako/aztec-packages/commit/$FIX_COMMIT.patch" -o fix.patch
-          git -C aztec apply --verbose "$GITHUB_WORKSPACE/fix.patch"
+          # The whole branch diff, so this keeps working when the fix spans several commits.
+          curl -fsSL "https://github.com/r3sako/aztec-packages/compare/$FIX_BASE...$FIX_COMMIT.diff" -o fix.diff
+          git -C aztec apply --verbose "$GITHUB_WORKSPACE/fix.diff"
 
       - name: Install Zig ${{ env.ZIG_VERSION }} and Ninja
         run: |
